@@ -27,7 +27,8 @@ LABEL = 'local.codex.continuity'
 DOMAIN = f'gui/{os.getuid()}'
 PLIST = Path.home()/'Library/LaunchAgents'/(LABEL+'.plist')
 PYTHON = '/usr/bin/python3'
-FILES = ('sync.py','projects.py','history.py','Watcher.swift','manage.py')
+OLD_FILES = ('sync.py','projects.py','history.py','Watcher.swift','manage.py')
+FILES = OLD_FILES + ('capabilities.py','doctor.py','settings_ui.py')
 
 
 def ensure(ok, message):
@@ -110,7 +111,7 @@ def check_bin():
     check_dir(BIN)
     own_file(BIN/'manifest.json')
     manifest=json.loads((BIN/'manifest.json').read_bytes())
-    ensure(set(manifest)==set(FILES)|{'Watcher'} and
+    ensure(set(manifest) in (set(FILES)|{'Watcher'}, set(OLD_FILES)|{'Watcher'}) and
            {f.name for f in BIN.iterdir()}==set(manifest)|{'manifest.json'},
            'Unexpected files in the installed directory.')
     ensure(all(digest(BIN/n)==h for n,h in manifest.items()), 'An installed file failed its integrity check.')
@@ -166,12 +167,12 @@ def install(policy):
     store = sync.Store()
     has_policy = os.path.lexists(store.enrollment)
     if has_policy:
-        ensure(store.policy() == policy, 'Enrollment differs. Uninstall and archive private state before changing scope.')
+        ensure(sync.equivalent(store.policy(), policy), 'Enrollment differs. Use configure to change sharing settings.')
     elif old or os.path.lexists(store.baseline) or any(store.backups.glob('*.json')):
         ensure(sync.legacy_policy(policy), 'Legacy installation requires --profiles all --include-history.')
     store.update('plan', policy)
     current={n:digest(base/n) for n in FILES}
-    if old and has_policy and all(old[k]==v for k,v in current.items()):
+    if old and has_policy and all(old.get(k)==v for k,v in current.items()):
         start()
         print('Already installed. The exit listener is running.')
         return
@@ -189,7 +190,7 @@ def install(policy):
         deployment_started = False
         try:
             with locked():
-                ensure(not (DATA/'pending.json').exists(), 'A pending transaction must finish before upgrading.')
+                ensure(not os.path.lexists(sync.Store().pending), 'A pending transaction must finish before upgrading.')
                 deployment_started = True
                 if old:
                     stop()
@@ -225,57 +226,159 @@ def install(policy):
             shutil.rmtree(stage)
 
 
+def saved_policy(store):
+    return store.policy() if os.path.lexists(store.enrollment) else None
+
+
+def public_policy(policy):
+    if policy is None:
+        return None
+    return {"profiles": policy['scope'], "labels": [o[:12] for o in policy['owners']],
+            "features": sync.policy_features(policy)}
+
+
+def status(store):
+    svc = check_service()
+    return {"listener": "running" if svc.returncode == 0 and "state = running" in svc.stdout else "stopped",
+            "policy": public_policy(saved_policy(store)),
+            "last_sync": store.load(store.log, {"state": "no-sync-under-current-policy"}),
+            "recovery_points": len(list(store.backups.glob("*.json")))}
+
+
+def print_status(info, lang='en'):
+    zh = lang == 'zh'
+    print(('退出监听器：' if zh else 'Exit listener: ') + (
+        {'running':'运行中','stopped':'已停止'}[info['listener']] if zh else info['listener']))
+    p = info['policy']
+    if p:
+        group = ('所有已初始化身份（含以后新增）' if zh else 'all initialized, including future'
+                 ) if p['profiles']=='all' else ', '.join(p['labels'])
+        print('共享模式：' if zh else 'Sharing:', p['features'], '|', group)
+    else:
+        print('尚未配置共享。' if zh else 'Sharing has not been configured.')
+    report = info['last_sync']
+    state = report.get('state','unknown')
+    print('最近结果：' if zh else 'Last result:', state,
+          '| 恢复点：' if zh else '| Recovery points:', info['recovery_points'])
+    if 'time' in report:
+        print('记录时间：' if zh else 'Recorded at:', time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(report['time'])))
+    c = report.get('counts', {})
+    if 'profiles' in c:
+        print('身份数：' if zh else 'Profiles:', c['profiles'],
+              '| 项目数：' if zh else '| Projects:', c.get('projects', {}).get('projects', 0),
+              '| 分组冲突：' if zh else '| Conflicts:', c.get('projects', {}).get('conflicts', 0),
+              '| 补入输入记录：' if zh else '| Recall entries copied:', c.get('history', {}).get('entries_copied', 0))
+
+
+def apply_settings(store, before_token, candidate):
+    check_dir(ROOT)
+    check_dir(DATA)
+    with locked('admin.lock'):
+        manifest = check_bin()
+        ensure(manifest.get("sync.py") == digest(Path(__file__).resolve().with_name("sync.py")),
+               "Upgrade the installed helper before changing its policy.")
+        with locked():
+            ensure(digest(store.enrollment) == before_token, "The policy changed while you were reviewing it. Open settings again.")
+            return store.reconfigure(candidate)
+
+
+def enroll_and_install(policy):
+    recognized_app()
+    for p in (ROOT, DATA, DATA/'backups'):
+        p.mkdir(mode=0o700, exist_ok=True)
+        check_dir(p)
+    with locked('admin.lock'):
+        install(policy)
+
+
 def main():
-    parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action',choices=('profiles','install','status','preview','restore','uninstall'))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=('profiles','install','upgrade','settings','configure','capabilities',
+                                           'doctor','status','preview','restore','uninstall'))
+    parser.add_argument('operation', nargs='?', choices=('show','baseline','compare'), help='doctor operation')
     parser.add_argument('--profiles', metavar='existing|all|LABEL[,LABEL...]',
-                        help='Existing (or current) freezes all currently verified profiles. All includes future profiles.')
-    parser.add_argument('--include-history', action='store_true',
-                        help='Also include eligible local composer history; default: project organization only.')
-    args=parser.parse_args()
-    cmd=args.action
-    if cmd not in ('install','preview') and (args.profiles is not None or args.include_history):
-        parser.error('Enrollment options apply only to install and preview.')
-    if cmd=='install' and args.profiles is None:
+                        help='Freeze current identities, include future ones, or select local profile labels.')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--features', choices=('folders','folders-history','projects','history','both','off'), help='Independent local sharing modes.')
+    group.add_argument('--include-history', action='store_true', help='Compatibility alias for --features both.')
+    parser.add_argument('--replace-baseline', action='store_true', help='Replace an existing doctor baseline.')
+    parser.add_argument('--json', action='store_true', help='Machine-readable settings, status, capabilities or doctor report.')
+    parser.add_argument('--lang', choices=('en','zh'), default='en', help='Language for the settings and capabilities views.')
+    args = parser.parse_args()
+    cmd = args.action
+    if (args.operation or args.replace_baseline) and cmd != 'doctor':
+        parser.error('Doctor options apply only to the doctor command.')
+    if args.replace_baseline and args.operation != 'baseline':
+        parser.error('--replace-baseline requires doctor baseline.')
+    feature = 'both' if args.include_history else args.features
+    if (args.profiles is not None or feature is not None) and cmd not in ('install','configure','preview'):
+        parser.error('Enrollment options apply only to install, configure or preview.')
+    if cmd == 'install' and args.profiles is None:
         parser.error('Install requires explicit --profiles selection.')
-    if args.include_history and args.profiles is None:
-        parser.error('--include-history requires an explicit --profiles selection.')
+    if cmd == 'configure' and args.profiles is None and feature is None:
+        parser.error('Choose --profiles or --features; use settings for the guided editor.')
     sync.require_default_home()
     os.umask(0o077)
-    if cmd=='profiles':
-        print(json.dumps(sync.Store().list_profiles()))
+    store = sync.Store()
+    if cmd == 'doctor':
+        import doctor
+        result = doctor.run(args.operation or 'show', data=DATA, codex=sync.CODEX,
+                            replace_baseline=args.replace_baseline)
+        print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else doctor.format_report(result, args.lang))
         return
-    if cmd=='preview':
-        store = sync.Store()
-        policy = store.select(args.profiles, args.include_history)
+    if cmd == 'profiles':
+        print(json.dumps(store.list_profiles()))
+        return
+    if cmd == 'capabilities':
+        import capabilities
+        current = saved_policy(store)
+        rows = capabilities.report(sync.policy_features(current) if current else None, args.lang)
+        if args.json:
+            print(json.dumps(rows, ensure_ascii=False))
+        else:
+            labels = {'enabled':'已启用','disabled':'未启用','unconfigured':'尚未设置',
+                      'local-audit':'本机检查','account':'由账号管理','native':'在 Codex 操作'}
+            for row in rows:
+                kind = row['setting'] or row['control']
+                print(f"{row['feature']} [{labels[kind] if args.lang=='zh' else kind}]  {row['action']}")
+        return
+    if cmd == 'status':
+        value = status(store)
+        if args.json:
+            print(json.dumps(value))
+        else:
+            print_status(value, args.lang)
+        return
+    if cmd == 'settings':
+        before_token = digest(store.enrollment) if os.path.lexists(store.enrollment) else None
+        previous = saved_policy(store)
+        if args.json or not sys.stdin.isatty():
+            print(json.dumps(public_policy(previous)))
+            return
+        import settings_ui
+        will_install = previous is None or not BIN.is_dir()
+        candidate = settings_ui.edit(store, lang=args.lang, will_install=will_install)
+        if candidate is not None:
+            if will_install:
+                enroll_and_install(candidate)
+            else:
+                print(json.dumps(apply_settings(store, before_token, candidate)))
+        return
+    if cmd == 'preview':
+        policy = store.propose(args.profiles, feature)
         print(json.dumps(store.update('plan', policy), ensure_ascii=False))
         return
-    if cmd=='install':
-        recognized_app()
-        policy = sync.Store().select(args.profiles, args.include_history)
-        for p in (ROOT,DATA,DATA/'backups'):
-            p.mkdir(mode=0o700,exist_ok=True)
-            check_dir(p)
-        with locked('admin.lock'):
-            install(policy)
+    if cmd == 'install':
+        enroll_and_install(store.propose(args.profiles, feature or 'projects'))
         return
-    if cmd=='status':
-        svc=check_service()
-        print('Exit listener: '+('running' if svc.returncode==0 and 'state = running' in svc.stdout else 'stopped'))
-        p=DATA/'status.json'
-        if p.is_file():
-            own_file(p)
-            report=json.loads(p.read_bytes())
-            print('Last result:',report.get('state','unknown'))
-            if 'time' in report:
-                print('Recorded at:',time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(report['time'])))
-            c=report.get('counts',{})
-            if 'profiles' in c:
-                print('Profiles:',c['profiles'],' Projects:',c.get('projects',{}).get('projects',0),
-                      ' Project conflicts:',c.get('projects',{}).get('conflicts',0),
-                      ' Recall entries copied:',c.get('history',{}).get('entries_copied',0))
-        else:
-            print('Waiting for the first offline sync.')
+    if cmd == 'upgrade':
+        ensure(BIN.is_dir() and saved_policy(store) is not None, "Install the helper and explicitly select profiles first.")
+        enroll_and_install(store.policy())
+        return
+    if cmd == 'configure':
+        ensure(os.path.lexists(store.enrollment) and BIN.is_dir(), "Install the helper before reconfiguring it.")
+        before_token = digest(store.enrollment)
+        print(json.dumps(apply_settings(store, before_token, store.propose(args.profiles, feature))))
         return
     check_dir(ROOT)
     check_dir(DATA)
@@ -292,7 +395,7 @@ def modify(cmd):
         sys.path.insert(0,str(src.parent))
         from sync import offline
         ensure(offline(), 'Quit the desktop app before restoring. The listener is still in its previous state.')
-        ensure(any((DATA/'backups').glob('*.json')), 'There is no recovery point yet. The listener is still in its previous state.')
+        ensure(any(sync.Store().backups.glob('*.json')), 'There is no recovery point yet. The listener is still in its previous state.')
         with locked():
             stop()
             PLIST.unlink(missing_ok=True)
@@ -301,7 +404,7 @@ def modify(cmd):
         return
     if cmd=='uninstall':
         with locked():
-            ensure(not (DATA/'pending.json').exists(), 'An unfinished transaction needs recovery after the desktop app exits.')
+            ensure(not os.path.lexists(sync.Store().pending), 'An unfinished transaction needs recovery after the desktop app exits.')
             if os.path.lexists(BIN):
                 check_bin()
             stop()

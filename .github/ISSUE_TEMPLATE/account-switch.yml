@@ -1,0 +1,28 @@
+name: Report a multi-profile continuity problem
+description: Describe what changed on the same Mac, using disposable examples.
+title: "[Continuity] "
+body:
+  - type: markdown
+    attributes:
+      value: Use A and B for identities and a made-up project name. Keep account labels, email addresses, local paths, prompt text, databases, backups and authentication files private.
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: macOS, desktop app build and helper release or commit.
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Sharing mode
+      options: [folders, folders-history, projects, history, both, "off", not installed]
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: What happened on A, on B, and after switching back?
+      description: Include the expected behavior, the actual UI result, and whether the desktop app fully exited. For diagnostics, report only counts and whether the active profile was the same, different or unknown.
+    validations:
+      required: true

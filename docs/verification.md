@@ -33,8 +33,21 @@ The **recurring helper** has been tested on synthetic fixtures and a private cop
 4. With no further changes, another quit should leave the native file alone. Reopening immediately may defer the sync. Check `status`.
 5. For plugin comparisons, distinguish **installed**, **available here**, and **connected**. For schedules, compare ID, target, enabled/paused state and the next *natural* run. Do not force a job just to check its visibility.
 
+## Exercise a policy change
+
+Use disposable fixtures for changes you would not want to make on real profiles. The test suite checks the behavior at these boundaries:
+
+- In `folders`, register a project on A. B receives the folder and its place in the list. B's explicit chat assignments, exclusions and sidebar preference remain B's own. Folder-only sync works even when the test database has no chat table.
+- In `history`, append a harmless query. B can recall it even when the fixture has no project tables. Project grouping is not inspected for that operation.
+- Narrow the group, pause, and then re-enable the earlier choices. Policy changes do not write the native file. Old recovery points cannot be applied to new participants, including after a round trip through the same settings. Pause can operate without opening the native database.
+- Compare synthetic plugin/schedule inventories across two identities. A status change, target change, missing definition and missing data are distinguishable. The comparison does not exercise any plugin or send a scheduled prompt.
+
 ## Storage and limits
 
 The tested layout uses a local renderer state file and the v5 thread/project SQLite index. The worker opens the index read-only and preserves the original thread IDs. An eligible recall scope needs a local user-facing thread and a regular local session file in the supported location. Unknown schemas, foreign host hints and cloud-backed project definitions are outside the supported set.
 
 The writer checks for an active desktop process, singleton state and concurrent edits before replacing the JSON. The desktop app does not take this helper's lock; an unrelated writer can still race the last check. Recovery uses fingerprints and refuses an ambiguous partial write. An unrecognized format or custom file protection is a reason to defer. If reporting a problem, give the operating system, desktop build, helper commit, status code and reproduction steps with a disposable test chat. Keep prompt text, local paths, identity labels and state files private.
+
+## Where to report a finding
+
+For a problem with this helper, use the [multi-profile issue form](https://github.com/0xZoharHuang/codex-local-continuity/issues/new?template=account-switch.yml). For a reproducible desktop behavior independent of the helper, first check the [upstream feature request](https://github.com/openai/codex/issues/60337) and [project visibility report](https://github.com/openai/codex/issues/60364). Add the build, whether the issue happens on A → B or on the return to A, which native view was checked, and the expected choice. Say explicitly when the observation was on a fixture or read from disk. The [upstream contribution guide](https://github.com/openai/codex/blob/main/docs/contributing.md) welcomes new evidence on existing issues. Never attach a real global-state file to demonstrate the problem.
