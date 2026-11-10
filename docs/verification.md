@@ -1,0 +1,40 @@
+# Verification
+
+## Run with synthetic data
+
+From the repository root:
+
+```sh
+PYTHONPATH=src /usr/bin/python3 -B -m unittest discover -v -s tests -p 'test_*.py'
+/usr/bin/swiftc -swift-version 6 -warnings-as-errors -typecheck src/Watcher.swift
+```
+
+The unit and transaction tests use temporary native JSON and SQLite fixtures. They cover independently edited project views, conflicting edits, an incomplete or newly enrolled profile, explicit ungrouping, and a remote host hint on an otherwise local-looking thread. Input tests cover double sends, overlapping caches at first enrollment, unsupported rich content, remaining capacity and a second pass with no changes. Transaction tests interrupt the worker on either side of replacement, reopen the app during a proposed write, and exercise restore after related and unrelated later edits.
+
+In an interactive macOS GUI session you can also run:
+
+```sh
+/usr/bin/python3 -B tests/macos_watcher_smoke.py
+```
+
+The smoke test compiles a temporary listener and an independent fixture application. The fixture exits normally. A stub worker records whether the old PID has gone away and how many times the exit was delivered. It never quits the real desktop app. Headless CI runs the fixture suite and compiles the listener; the GUI smoke test needs a logged-in Aqua session.
+
+## What has been observed
+
+On macOS 15.5 / Apple Silicon with desktop build 26.1103.60933 (25894), a local project catalog and its local folders were present while the active native Projects section was empty. A backed-up **one-time** offline restoration made the original groups visible in the official sidebar after restart. A read-only sample could page turn summaries from local chats created under other identities. Neither observation proves access to every chat, attachment or connected service.
+
+The **recurring helper** has been tested on synthetic fixtures and a private copy of the native layout. Its project and recall changes were reversible in the tested scenarios. The live listener has been installed and observed running. At initial publication, a complete natural A → B → A sign-in with a physical ↑ keypress and this recurring helper has not been verified. The one-time restoration and the independent GUI smoke test are different experiments.
+
+## End-to-end acceptance on a trusted Mac
+
+1. Select two authorized profiles. Use the same Codex mode, host, project directory and local thread for both. Start with the read-only preview. Record which chat is explicitly ungrouped.
+2. In A, send a harmless plain-text marker in the test thread. Switch normally to B, quit the desktop app, then reopen it. Check the original project names and IDs, the ungrouped chat, and ↑ in the empty composer. Allow for B's existing entries on the first import.
+3. Send a different marker in B and repeat the trip to A. Verify that new input returns to A in the same thread, that a different thread does not recall either marker, and that drafts and pending submissions have not moved.
+4. With no further changes, another quit should leave the native file alone. Reopening immediately may defer the sync. Check `status`.
+5. For plugin comparisons, distinguish **installed**, **available here**, and **connected**. For schedules, compare ID, target, enabled/paused state and the next *natural* run. Do not force a job just to check its visibility.
+
+## Storage and limits
+
+The tested layout uses a local renderer state file and the v5 thread/project SQLite index. The worker opens the index read-only and preserves the original thread IDs. An eligible recall scope needs a local user-facing thread and a regular local session file in the supported location. Unknown schemas, foreign host hints and cloud-backed project definitions are outside the supported set.
+
+The writer checks for an active desktop process, singleton state and concurrent edits before replacing the JSON. The desktop app does not take this helper's lock; an unrelated writer can still race the last check. Recovery uses fingerprints and refuses an ambiguous partial write. An unrecognized format or custom file protection is a reason to defer. If reporting a problem, give the operating system, desktop build, helper commit, status code and reproduction steps with a disposable test chat. Keep prompt text, local paths, identity labels and state files private.

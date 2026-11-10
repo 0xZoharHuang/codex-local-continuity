@@ -1,0 +1,20 @@
+name: Checks
+
+on: [push, pull_request]
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Native state and recovery fixtures
+        env:
+          PYTHONPATH: src
+        run: /usr/bin/python3 -B -m unittest discover -v -s tests -p 'test_*.py'
+      - name: Compile the exit listener
+        run: /usr/bin/swiftc -swift-version 6 -warnings-as-errors src/Watcher.swift -o "$RUNNER_TEMP/continuity-watcher"
