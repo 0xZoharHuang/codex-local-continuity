@@ -4,31 +4,68 @@ import Foundation
 enum SyncTrigger: Equatable {
     case startupOffline
     case terminated(pid_t)
+    case capture
 }
 
 // Called on the main queue. A later exit supersedes pending work from an
 // earlier exit, including one that happened while the worker was running.
 struct SyncQueue {
-    private(set) var pending: SyncTrigger?
+    private var pendingSync: SyncTrigger?
+    private var pendingCapture = false
     private(set) var busy = false
 
     mutating func request(_ trigger: SyncTrigger) {
-        pending = trigger
+        if trigger == .capture {
+            pendingCapture = true
+        } else {
+            pendingSync = trigger
+            pendingCapture = false
+        }
     }
 
     mutating func applicationLaunched() {
-        pending = nil
+        pendingSync = nil
     }
 
     mutating func take() -> SyncTrigger? {
-        guard !busy, let trigger = pending else { return nil }
-        pending = nil
+        guard !busy else { return nil }
+        let trigger = pendingSync ?? (pendingCapture ? .capture : nil)
+        guard let trigger else { return nil }
+        pendingSync = nil
+        pendingCapture = false
         busy = true
         return trigger
     }
 
     mutating func finished() {
         busy = false
+    }
+}
+
+struct FileStamp: Equatable {
+    let device: dev_t
+    let inode: ino_t
+    let size: off_t
+    let modifiedSeconds: Int
+    let modifiedNanos: Int
+    let changedSeconds: Int
+    let changedNanos: Int
+
+    init?(_ path: String) {
+        var info = stat()
+        guard lstat(path, &info) == 0, info.st_uid == getuid(),
+              info.st_mode & S_IFMT == S_IFREG || info.st_mode & S_IFMT == S_IFDIR else { return nil }
+        device = info.st_dev
+        inode = info.st_ino
+        size = info.st_size
+        modifiedSeconds = info.st_mtimespec.tv_sec
+        modifiedNanos = info.st_mtimespec.tv_nsec
+        changedSeconds = info.st_ctimespec.tv_sec
+        changedNanos = info.st_ctimespec.tv_nsec
+    }
+
+    func sameFile(as other: FileStamp?) -> Bool {
+        other?.device == device && other?.inode == inode
     }
 }
 
@@ -61,6 +98,8 @@ struct AppTarget {
 final class Watcher: NSObject {
     private let workspace = NSWorkspace.shared
     private let target = AppTarget.codex
+    private let stateURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".codex/.codex-global-state.json")
     private let workerURL: URL
     private var observers: [NSObjectProtocol] = []
     private var runningAppsObserver: NSKeyValueObservation?
@@ -68,12 +107,20 @@ final class Watcher: NSObject {
     private var lastCompletedPID: pid_t?
     private var queue = SyncQueue()
     private var worker: Process?
+    private var stateSource: DispatchSourceFileSystemObject?
+    private var directorySource: DispatchSourceFileSystemObject?
+    private var watchedState: FileStamp?
+    private var watchedDirectory: FileStamp?
+    private var lastState: FileStamp?
+    private var captureDeadline: TimeInterval?
+    private var captureTimer: DispatchWorkItem?
 
     init(workerURL: URL) {
         self.workerURL = workerURL
     }
 
     func start() {
+        refreshStateWatches()
         observe(NSWorkspace.willLaunchApplicationNotification, onTermination: false)
         observe(NSWorkspace.didTerminateApplicationNotification, onTermination: true)
         runningAppsObserver = workspace.observe(\.runningApplications, options: []) { [weak self] _, _ in
@@ -84,6 +131,71 @@ final class Watcher: NSObject {
             queue.request(.startupOffline)
             drain()
         }
+    }
+
+    private func fileSource(_ url: URL, events: DispatchSource.FileSystemEvent) -> DispatchSourceFileSystemObject? {
+        let fd = open(url.path, O_EVTONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard fd >= 0 else { return nil }
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: events, queue: .main)
+        source.setEventHandler { [weak self] in self?.refreshStateWatches() }
+        source.setCancelHandler { close(fd) }
+        source.resume()
+        return source
+    }
+
+    private func refreshStateWatches() {
+        let parentURL = stateURL.deletingLastPathComponent()
+        // Keep a parent watch when .codex is absent or replaced, then attach
+        // to the exact directory and file as soon as they appear.
+        let directory = FileStamp(parentURL.path) == nil ? parentURL.deletingLastPathComponent() : parentURL
+        let parent = FileStamp(directory.path)
+        if parent?.sameFile(as: watchedDirectory) != true {
+            directorySource?.cancel()
+            directorySource = nil
+            watchedDirectory = nil
+            if let parent {
+                directorySource = fileSource(directory, events: [.write, .rename, .delete])
+                if directorySource != nil { watchedDirectory = parent }
+            }
+        }
+        let current = FileStamp(stateURL.path)
+        if current?.sameFile(as: watchedState) != true {
+            stateSource?.cancel()
+            stateSource = nil
+            watchedState = nil
+            if let current {
+                stateSource = fileSource(stateURL, events: [.write, .rename, .delete, .attrib])
+                if stateSource != nil { watchedState = current }
+            }
+        }
+        guard current != lastState else { return }
+        lastState = current
+        if current != nil && !exitSources.isEmpty {
+            scheduleCapture()
+        }
+    }
+
+    private func scheduleCapture() {
+        let now = ProcessInfo.processInfo.systemUptime
+        if captureDeadline == nil { captureDeadline = now + 1 }
+        captureTimer?.cancel()
+        let delay = min(0.5, max(0, captureDeadline! - now))
+        let timer = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.captureTimer = nil
+            self.captureDeadline = nil
+            guard !self.exitSources.isEmpty else { return }
+            self.queue.request(.capture)
+            self.drain()
+        }
+        captureTimer = timer
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: timer)
+    }
+
+    private func cancelCapture() {
+        captureTimer?.cancel()
+        captureTimer = nil
+        captureDeadline = nil
     }
 
     private func observe(_ name: Notification.Name, onTermination: Bool) {
@@ -120,6 +232,12 @@ final class Watcher: NSObject {
         }
         exitSources[pid] = source
         source.resume()
+        refreshStateWatches()
+        if lastState != nil {
+            cancelCapture()
+            queue.request(.capture)
+            drain()
+        }
     }
 
     private func applicationTerminated(_ app: NSRunningApplication) {
@@ -136,6 +254,7 @@ final class Watcher: NSObject {
         lastCompletedPID = pid
         exitSources.removeValue(forKey: pid)?.cancel()
         guard exitSources.isEmpty else { return }
+        cancelCapture()
         queue.request(.terminated(pid))
         drain()
     }
@@ -144,7 +263,7 @@ final class Watcher: NSObject {
         guard let trigger = queue.take() else { return }
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        task.arguments = ["-I", "-B", workerURL.path, "sync"]
+        task.arguments = ["-I", "-B", workerURL.path, trigger == .capture ? "capture" : "sync"]
         var environment = ProcessInfo.processInfo.environment
         environment.removeValue(forKey: "CODEX_CONTINUITY_EXIT_PID")
         switch trigger {
@@ -153,6 +272,8 @@ final class Watcher: NSObject {
         case .terminated(let pid):
             environment["CODEX_CONTINUITY_TRIGGER"] = "termination"
             environment["CODEX_CONTINUITY_EXIT_PID"] = String(pid)
+        case .capture:
+            environment["CODEX_CONTINUITY_TRIGGER"] = "native-state-changed"
         }
         task.environment = environment
         task.standardInput = FileHandle.nullDevice

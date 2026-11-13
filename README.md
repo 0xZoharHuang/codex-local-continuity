@@ -2,13 +2,19 @@
 
 A macOS helper for people who use more than one Codex desktop profile on a trusted Mac. It carries local project organization between the profiles you select. You can separately opt in to sharing eligible sent prompts, so pressing **↑** in an empty composer can recall text from the **same local chat** after switching accounts.
 
-For example, you move a chat into a project under profile A, sign into B, then quit the desktop app as usual. After the next launch, B can see the move in its native sidebar. The helper has no window. It listens for a desktop exit, checks that the app is offline and merges local metadata. A rapid relaunch can defer the merge until a later exit.
+For example, you move a chat into a project under profile A, sign into B, then quit the desktop app as usual. After the next launch, B can see the move in its native sidebar. The helper has no window. It checks the native layout and writes only after a desktop exit. On newer builds that clear live input recall during account switching, it also keeps a read-only checkpoint when the desktop saves eligible input changes. A rapid relaunch can defer the merge until a later exit.
 
 This is an independent, experimental tool. It uses an undocumented desktop storage format. A future release can change the format or apply different visibility rules. [中文说明](docs/zh-CN.md) · [Account and API behavior](docs/account-boundaries.md) · [Verification](docs/verification.md)
 
+## Desktop 26.1106 and later
+
+Build 26605 removed the old per-account project container. Local projects and manual groupings are now native shared data. In this layout the helper's project sharing choices do not override the desktop's own visibility. Its remaining role is optional per-thread input continuity: the native app clears that live input cache on identity changes. Enable history only for profiles allowed to reuse those input texts.
+
+Beta.1 could record `unrecognized-layout-or-io-KeyError` after this migration. Upgrade from the checkout with `/usr/bin/python3 -I -B src/manage.py upgrade`; the adapter preserves the saved consent. Status reports the detected layout and the last recall checkpoint. Earlier native-format recovery points are retained and cannot be applied to the new layout. A snapshot cannot distinguish a native account reset from an intentional empty recall clear: captured text can be restored in either case. Choose `off` before deliberately clearing history that should stay cleared. There is a short best-effort window before a saved change is captured; see the [timing limits](docs/verification.md#desktop-storage-migration-in-build-26605).
+
 ## Try it without installing
 
-Requires macOS, the standard user-owned `~/.codex` layout, and a desktop profile initialized by a normal sign-in. The installer recognizes one `Codex.app` or `ChatGPT.app` with bundle ID `com.openai.codex` in `/Applications` or `~/Applications`. Custom `CODEX_HOME` locations are unsupported. The tested desktop build is **26.1103.60933 (25894)** on macOS 15.5, Apple Silicon. Building the watcher requires Swift and system Python via the Xcode Command Line Tools.
+Requires macOS, the standard user-owned `~/.codex` layout, and a desktop profile initialized by a normal sign-in. The installer recognizes one `Codex.app` or `ChatGPT.app` with bundle ID `com.openai.codex` in `/Applications` or `~/Applications`. Custom `CODEX_HOME` locations are unsupported. The original tested layout is **26.1103.60933 (25894)**. A second adapter handles **26.1106.51428 (26605)** on macOS 15.5, Apple Silicon. Building the watcher requires Swift and system Python via the Xcode Command Line Tools.
 
 ```sh
 git clone https://github.com/0xZoharHuang/codex-local-continuity.git
@@ -83,7 +89,7 @@ Run `src/manage.py capabilities` with system Python to see the controls and nati
 
 To undo the most recent sync, fully quit the desktop app, then run `/usr/bin/python3 -I -B src/manage.py restore`. Restore stops the listener. It refuses to overwrite affected values that have been edited since the sync. Uninstall removes the listener and its installed code; it leaves the native layout and private recovery data in place.
 
-The user LaunchAgent is `local.codex.continuity`. Its files are in `~/Library/Application Support/CodexLocalContinuity`. Up to five recovery points are retained per sharing policy period. Changing the settings starts a fresh recovery area; the helper keeps up to five previous generated areas plus any original legacy recovery data. Recovery points can contain prior prompt text or rich entries from changed buckets. Their directory is private to the macOS user. Keep it out of bug reports, along with authentication files, native global state and session transcripts.
+The user LaunchAgent is `local.codex.continuity`. Its files are in `~/Library/Application Support/CodexLocalContinuity`. Up to five recovery points are retained per sharing policy period. Changing the settings starts a fresh recovery area; the helper keeps up to five previous generated areas plus any original legacy recovery data. Recovery points can contain prior prompt text or rich entries from changed buckets. In the migrated layout, `recall-v2.json` also stores eligible plain input snapshots so they survive the desktop clearing its live cache. Pausing or uninstalling retains these private data files. Their directory is private to the macOS user. Keep it out of bug reports, along with authentication files, native global state and session transcripts.
 
 To update an installed copy from a new checkout, run `/usr/bin/python3 -I -B src/manage.py upgrade`. This keeps your saved group and features. Use `configure` or the settings editor to change consent explicitly.
 

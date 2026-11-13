@@ -51,3 +51,13 @@ The writer checks for an active desktop process, singleton state and concurrent 
 ## Where to report a finding
 
 For a problem with this helper, use the [multi-profile issue form](https://github.com/0xZoharHuang/codex-local-continuity/issues/new?template=account-switch.yml). For a reproducible desktop behavior independent of the helper, first check the [upstream feature request](https://github.com/openai/codex/issues/60337) and [project visibility report](https://github.com/openai/codex/issues/60364). Add the build, whether the issue happens on A → B or on the return to A, which native view was checked, and the expected choice. Say explicitly when the observation was on a fixture or read from disk. The [upstream contribution guide](https://github.com/openai/codex/blob/main/docs/contributing.md) welcomes new evidence on existing issues. Never attach a real global-state file to demonstrate the problem.
+
+## Desktop storage migration in build 26605
+
+Desktop 26.1106.51428 migrates the old account renderer container into shared local project state and per-owner settings. Its account switch clears live composer history. Beta.1 assumed the older wrapper and recorded a KeyError after this upgrade. The observed installation has two successful older writes, followed by the format error.
+
+The updated adapter identifies the two formats. On the migrated format it leaves the native shared project registry to the desktop. It watches persisted JSON changes to checkpoint eligible sent text in the helper's private scope. Native writes still require a complete app exit and a verified destination owner. A same-owner startup preserves the restored live cache according to the installed code path; a real A → B → A keyboard check remains pending.
+
+The adapter can seed missing snapshots from eligible pre-change input fragments in its own compatible private recovery points. Such fragments are incomplete and have no exact cross-account ordering. Text already cleared before a checkpoint and absent from those recovery points cannot be recreated by this helper. The watcher is event-driven with a 0.5-second debounce, a one-second scheduling bound per burst and serialized workers. An immediate sign-out before persisted text is captured can still lose that latest cache entry.
+
+Current source tests simulate A's persisted inputs, a switch that clears the live cache, B's normal exit, restoration, no-op replay, an interrupted transaction, quick reopen, new-format diagnostics, and refusal to apply a legacy recovery point across the migration. An independent Aqua fixture tests file replacement, in-place save, directory replacement, unrelated SQLite writes and exit while a checkpoint worker is busy.

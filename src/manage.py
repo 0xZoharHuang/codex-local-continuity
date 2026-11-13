@@ -28,7 +28,8 @@ DOMAIN = f'gui/{os.getuid()}'
 PLIST = Path.home()/'Library/LaunchAgents'/(LABEL+'.plist')
 PYTHON = '/usr/bin/python3'
 OLD_FILES = ('sync.py','projects.py','history.py','Watcher.swift','manage.py')
-FILES = OLD_FILES + ('capabilities.py','doctor.py','settings_ui.py')
+PRIOR_FILES = OLD_FILES + ('capabilities.py','doctor.py','settings_ui.py')
+FILES = PRIOR_FILES + ('native_layout.py','modern_sync.py','recall.py')
 
 
 def ensure(ok, message):
@@ -111,7 +112,7 @@ def check_bin():
     check_dir(BIN)
     own_file(BIN/'manifest.json')
     manifest=json.loads((BIN/'manifest.json').read_bytes())
-    ensure(set(manifest) in (set(FILES)|{'Watcher'}, set(OLD_FILES)|{'Watcher'}) and
+    ensure(set(manifest) in (set(FILES)|{'Watcher'}, set(PRIOR_FILES)|{'Watcher'}, set(OLD_FILES)|{'Watcher'}) and
            {f.name for f in BIN.iterdir()}==set(manifest)|{'manifest.json'},
            'Unexpected files in the installed directory.')
     ensure(all(digest(BIN/n)==h for n,h in manifest.items()), 'An installed file failed its integrity check.')
@@ -239,9 +240,15 @@ def public_policy(policy):
 
 def status(store):
     svc = check_service()
+    try:
+        layout = sync.inspect_layout(sync.read_json(sync.read_regular(store.live)))['kind']
+    except Exception:
+        layout = 'unknown'
     return {"listener": "running" if svc.returncode == 0 and "state = running" in svc.stdout else "stopped",
             "policy": public_policy(saved_policy(store)),
             "last_sync": store.load(store.log, {"state": "no-sync-under-current-policy"}),
+            "native_layout": layout,
+            "capture": store.load(store.baseline.parent/'capture-status.json',{'state':'not-yet-captured'}),
             "recovery_points": len(list(store.backups.glob("*.json")))}
 
 
@@ -250,6 +257,14 @@ def print_status(info, lang='en'):
     print(('退出监听器：' if zh else 'Exit listener: ') + (
         {'running':'运行中','stopped':'已停止'}[info['listener']] if zh else info['listener']))
     p = info['policy']
+    if info.get('native_layout')=='shared-v2':
+        print('项目由新版 App 原生共享；输入历史在保存时留存，退出后回填。' if zh else
+              'Projects are shared natively. Recall is checkpointed on saved changes and restored after exit.')
+        capture = info.get('capture',{})
+        print('输入留存：' if zh else 'Recall checkpoint:',capture.get('state','unknown'))
+        if capture.get('time'):
+            print('留存时间：' if zh else 'Checkpoint at:',
+                  time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(capture['time'])))
     if p:
         group = ('所有已初始化身份（含以后新增）' if zh else 'all initialized, including future'
                  ) if p['profiles']=='all' else ', '.join(p['labels'])
@@ -258,7 +273,13 @@ def print_status(info, lang='en'):
         print('尚未配置共享。' if zh else 'Sharing has not been configured.')
     report = info['last_sync']
     state = report.get('state','unknown')
-    print('最近结果：' if zh else 'Last result:', state,
+    old_failure = (info.get('native_layout')=='shared-v2' and
+                   info.get('capture',{}).get('state')=='captured' and
+                   state=='unrecognized-layout-or-io-KeyError')
+    if old_failure:
+        print('旧版的格式错误已适配，输入留存已恢复；等待下一次退出回填。' if zh else
+              'The previous format error is now supported. Recall capture is active; awaiting the next exit.')
+    print('最近退出结果：' if zh else 'Last exit result:', state,
           '| 恢复点：' if zh else '| Recovery points:', info['recovery_points'])
     if 'time' in report:
         print('记录时间：' if zh else 'Recorded at:', time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(report['time'])))
@@ -333,6 +354,14 @@ def main():
         import capabilities
         current = saved_policy(store)
         rows = capabilities.report(sync.policy_features(current) if current else None, args.lang)
+        try:
+            layout = sync.inspect_layout(sync.read_json(sync.read_regular(store.live)))
+        except Exception:
+            layout = None
+        if layout and layout['kind']=='shared-v2':
+            for row in rows:
+                if row['id'] in ('folders','projects'):
+                    row.update(control='native',setting=None,action='Codex → sidebar (native shared projects)')
         if args.json:
             print(json.dumps(rows, ensure_ascii=False))
         else:

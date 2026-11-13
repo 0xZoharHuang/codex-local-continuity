@@ -12,6 +12,7 @@ import secrets
 import sqlite3
 import stat
 import tempfile
+import native_layout
 
 
 CODEX = Path.home() / ".codex"
@@ -46,10 +47,11 @@ def identity(codex, key):
     check_regular(path)
     with path.open(encoding="utf-8") as f:
         state = json.load(f)
-    owner = state["electron-account-renderer-state-v1"]["owner"]
+    layout = native_layout.inspect(state)
+    owner = layout['active']
     if owner is None:
         return {"state":"no-active-profile"}, None, None, None
-    atoms = state["electron-persisted-atom-state"]
+    atoms = layout['owners'][owner]
     user = atoms["local-document-identity"]["userId"]
     account = atoms["local-document-identity"]["accountId"]
     if not all(isinstance(s, str) and s for s in (user, account)):
@@ -58,7 +60,7 @@ def identity(codex, key):
     if hashlib.sha256(data).hexdigest() != owner:
         raise ValueError("identity-in-transition")
     cached = atoms.get("heartbeat-thread-permissions-by-id")
-    return ({"state":"verified"}, digest(key, "owner", owner), (user, account),
+    return ({"state":"verified","native_layout":layout['kind']}, digest(key, "owner", owner), (user, account),
             set(cached) if isinstance(cached, dict) else None)
 
 

@@ -23,6 +23,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from history import sync_history
 from projects import sync_projects
+import native_layout
 
 ROOT = Path.home() / "Library/Application Support/CodexLocalContinuity"
 CODEX = Path.home() / ".codex"
@@ -179,7 +180,15 @@ def check_native_metadata(path):
         need(not re.search(r'^\s*\d+:', listing.stdout, re.M), "custom-native-file-acl")
 
 
+def inspect_layout(state):
+    try:
+        return native_layout.inspect(state)
+    except ValueError as error:
+        raise Refusal(str(error)) from None
+
+
 def profile_refs(state):
+    need(inspect_layout(state)['kind']=='legacy', 'legacy-recovery-incompatible-with-native-layout')
     wrap = state[SCOPES]
     need(isinstance(wrap, dict) and 'owner' in wrap and isinstance(wrap.get('inactive'), dict),
          "unsupported-identity-layout")
@@ -205,7 +214,7 @@ def profile_refs(state):
 
 
 def make_policy(state, selection, include_history=False, features=None):
-    refs, _ = profile_refs(state)
+    refs = inspect_layout(state)['owners']
     need(bool(refs), "no-initialized-profiles")
     indexes = {o[:12]: o for o in refs}
     need(len(indexes) == len(refs), "ambiguous-profile-label")
@@ -604,7 +613,8 @@ class Store:
         for area in archives[MAX_ARCHIVED_GENERATIONS:]:
             self._private_dir(area)
             files = list(area.iterdir())
-            need(all(p.name in ('backups','baseline.json','status.json','enrollment.json') for p in files),
+            need(all(p.name in ('backups','baseline.json','status.json','enrollment.json',
+                               'recall-v2.json','capture-status.json') for p in files),
                  'unexpected-archived-generation-file')
             backups = area/'backups'
             inner = []
@@ -671,10 +681,11 @@ class Store:
     def list_profiles(self):
         self.prepare(read_only=True)
         state = read_json(read_regular(self.live))
-        refs, _ = profile_refs(state)
+        layout = inspect_layout(state)
+        refs = layout['owners']
         labels = [o[:12] for o in refs]
         need(len(labels) == len(set(labels)), "ambiguous-profile-label")
-        return [{"label": o[:12], "active": o == state[SCOPES]["owner"]} for o in sorted(refs)]
+        return [{"label": o[:12], "active": o == layout['active']} for o in sorted(refs)]
 
     def select(self, selection, include_history=False):
         if selection is None:
@@ -732,6 +743,17 @@ class Store:
         self.prepare(read_only=action == 'plan')
         generation = self._location()[2]
         raw = read_regular(self.live)
+        layout = inspect_layout(read_json(raw))
+        if action == 'capture':
+            if layout['kind']=='legacy':
+                return {'state':'capture-not-required'}
+            import modern_sync
+            return modern_sync.capture(self)
+        if layout['kind']=='shared-v2':
+            import modern_sync
+            fresh = (preview_policy is not None and os.path.lexists(self.enrollment)
+                     and not equivalent(self.policy(),policy))
+            return modern_sync.update(self,action,raw,policy,fresh=fresh)
         if action != 'plan':
             need(self.is_offline(), 'app-running-deferred')
             self.recover(raw, policy)
@@ -825,7 +847,7 @@ class Store:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('sync','plan','status','restore'))
+    parser.add_argument('action', choices=('sync','capture','plan','status','restore'))
     args=parser.parse_args()
     require_default_home()
     os.umask(0o077)
@@ -850,7 +872,12 @@ def main():
             print(json.dumps(result, ensure_ascii=False))
         except Exception as error:
             code = str(error) if type(error) is Refusal else 'unrecognized-layout-or-io-' + type(error).__name__
-            store.mark(code)
+            if args.action=='capture':
+                capture_file = store.baseline.parent/'capture-status.json'
+                if code != 'capture-source-changed':
+                    replace(capture_file,packed({'state':code,'time':int(time.time())}))
+            else:
+                store.mark(code)
             print(code, file=sys.stderr)
             sys.exit(2)
 

@@ -54,7 +54,7 @@ class DoctorTests(unittest.TestCase):
 
     def profile(self,user,account,targets):
         encoded = json.dumps([user,account],separators=(",",":")).encode()
-        state = {"electron-account-renderer-state-v1":{"owner":hashlib.sha256(encoded).hexdigest()},
+        state = {"electron-account-renderer-state-v1":{"owner":hashlib.sha256(encoded).hexdigest(),"inactive":{}},
                  "electron-persisted-atom-state":{
                      "local-document-identity":{"userId":user,"accountId":account},
                      "heartbeat-thread-permissions-by-id":{t:"do not expose this policy" for t in targets},
