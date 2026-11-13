@@ -19,7 +19,13 @@ def _allowed(threads):
     return {t for t in threads if isinstance(t, str) and UUID.fullmatch(t)}
 
 
-def _prepare(ledger, owners):
+def _prepare(ledger, owners, retained_owners=None):
+    # The transaction owner validates the unchanged policy and generation before
+    # permitting historical identities to remain in this private envelope.
+    # Only currently verified owners participate in capture or merge below.
+    permitted = set(owners) if retained_owners is None else set(retained_owners)
+    if not set(owners) <= permitted:
+        raise ValueError('recall-owner-outside-retention-scope')
     if ledger is None:
         engine, _ = sync_history({}, None, {'threads': set()})
         result = {'version': 1, 'engine': engine, 'histories': {}, 'observed': {},
@@ -31,7 +37,7 @@ def _prepare(ledger, owners):
     if set(result) != {'version', 'engine', 'histories', 'observed', 'native_views', 'capture_sequence'}:
         raise ValueError('unsupported-recall-ledger')
     for field in ('histories', 'observed', 'native_views'):
-        if not isinstance(result[field], dict) or not set(result[field]) <= set(owners):
+        if not isinstance(result[field], dict) or not set(result[field]) <= permitted:
             raise ValueError('recall-ledger-outside-enrollment')
     if type(result['capture_sequence']) is not int or result['capture_sequence'] < 0:
         raise ValueError('invalid-recall-sequence')
@@ -65,6 +71,12 @@ def _observe(state, result, key, active, allowed, report):
         return
     private = result['histories'].setdefault(active, {})
     seen = result['observed'].setdefault(active, {})
+    # A witnessed empty/absent native window is a reset boundary. Keep its
+    # cached safe occurrences for recall, but end the old observation sequence
+    # so an equal prompt submitted after the reset remains a separate send.
+    for scope in seen:
+        if scope in allowed and (scope not in hist or hist[scope] == []):
+            seen[scope] = []
 
     def issue():
         result['capture_sequence'] += 1
@@ -133,18 +145,19 @@ def _restore_rows(raw, cached):
     return [values[eid] for eid in _merge_order(original_ids, incoming)]
 
 
-def capture(state, ledger, owners, active, allowed_threads):
+def capture(state, ledger, owners, active, allowed_threads, *, retained_owners=None):
     """Capture bounded shareable text into an isolated private ledger; leave state intact."""
-    result, key = _prepare(ledger, owners)
+    result, key = _prepare(ledger, owners, retained_owners)
     report = _report()
     if active in owners:
         _observe(state, result, key, active, _allowed(allowed_threads), report)
     return result, dict(report)
 
 
-def merge(state, ledger, owners, active, allowed_threads):
+def merge(state, ledger, owners, active, allowed_threads, *, retained_owners=None):
     """Restore/merge recall using existing occurrence-aware history logic, then cache it."""
-    result, report_dict = capture(state, ledger, owners, active, allowed_threads)
+    result, report_dict = capture(state, ledger, owners, active, allowed_threads,
+                                  retained_owners=retained_owners)
     report = Counter(report_dict)
     atoms = state.get(ATOMS)
     if active not in owners or not isinstance(atoms, dict):
@@ -266,14 +279,14 @@ def merge(state, ledger, owners, active, allowed_threads):
     return result, dict(report)
 
 
-def seed(ledger, receipts, owners, allowed_threads):
+def seed(ledger, receipts, owners, allowed_threads, *, retained_owners=None):
     """Seed absent caches from verified same-policy receipts, newest first.
 
     The parent must verify receipt consent/generation and authenticated owners.
     Only exact per-thread before arrays are used; deleted/overwritten scopes and
     their relative cross-owner chronology cannot be inferred from these receipts.
     """
-    result, _ = _prepare(ledger, owners)
+    result, _ = _prepare(ledger, owners, retained_owners)
     report = _report()
     allowed = _allowed(allowed_threads)
     for receipt in receipts:

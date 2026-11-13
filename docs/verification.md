@@ -61,3 +61,15 @@ The updated adapter identifies the two formats. On the migrated format it leaves
 The adapter can seed missing snapshots from eligible pre-change input fragments in its own compatible private recovery points. Such fragments are incomplete and have no exact cross-account ordering. Text already cleared before a checkpoint and absent from those recovery points cannot be recreated by this helper. The watcher is event-driven with a 0.5-second debounce, a one-second scheduling bound per burst and serialized workers. An immediate sign-out before persisted text is captured can still lose that latest cache entry.
 
 Current source tests simulate A's persisted inputs, a switch that clears the live cache, B's normal exit, restoration, no-op replay, an interrupted transaction, quick reopen, new-format diagnostics, and refusal to apply a legacy recovery point across the migration. An independent Aqua fixture tests file replacement, in-place save, directory replacement, unrelated SQLite writes and exit while a checkpoint worker is busy.
+
+## Repeated switches, rapid relaunch, and later upgrades
+
+The follow-up suite runs 65 bounded A/B/C cycles, empty-cache observations followed by repeated equal text, temporary identity disappearance and return, and narrowing the permitted group. A formerly verified profile can retain a private checkpoint, while only profiles verified in the current native state can source or receive a merge.
+
+The actual executable worker is also tested in a subprocess. Script and imported adapter now share one exception class and sentinel, so a concurrently replaced snapshot is classified as a transient defer instead of a misleading generic failure. A later successful unchanged capture clears that obsolete capture status.
+
+The GUI smoke test uses disposable applications to cover relaunch before sync, a same-path application package replacement, a capture that exits with an error, and an exit that arrives before the debounce timer. A deliberately stuck capture is terminated at its 30-second limit, freeing the queued exit sync. Writeback workers are never subject to that capture timeout.
+
+Immediately before native replacement, the writer rereads the file and exact consent generation, then checks that the app is still offline. A changed consent also prevents a no-change merge from storing an old wider checkpoint under new settings. Restoring a bucket revalidates that the thread still belongs to the supported local inventory. A new ownership-container version or a downgrade with an incompatible pending receipt produces a named refusal and preserves the native file and recovery evidence.
+
+These are bounded checks against observed layouts. An undocumented future desktop release can still require a new adapter. A same-content send whose preceding reset was never saved or observed remains indistinguishable from the old snapshot.

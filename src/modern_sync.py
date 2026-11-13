@@ -51,6 +51,10 @@ def paths(store):
     return store.baseline.parent/'recall-v2.json', store.baseline.parent/'capture-status.json'
 
 
+def consent_unchanged(store, token, policy):
+    return sync.read_regular(store.enrollment, True) == token and store.policy() == policy
+
+
 def check_envelope(store, value, policy):
     sync.need(value.get('layout') == LAYOUT and value.get('version') == 1
               and value.get('policy') == sync.fingerprint(sync.packed(policy))
@@ -60,6 +64,17 @@ def check_envelope(store, value, policy):
 def envelope(store, ledger, policy):
     return {'version':1, 'layout':LAYOUT, 'generation':store._location()[2],
             'policy':sync.fingerprint(sync.packed(policy)), 'ledger':ledger}
+
+
+def retained_owners(ledger, owners, policy):
+    if policy['scope']=='selected':
+        return set(policy['owners'])
+    # The envelope already proves this unchanged all-profile consent.
+    # Missing native identities remain private and do not participate in merge.
+    cached=set()
+    for key in ('histories','observed','native_views'):
+        cached.update(ledger.get(key,{}))
+    return set(owners)|cached
 
 
 def load_ledger(store, policy, raw, owners, allowed, fresh=False):
@@ -93,6 +108,7 @@ def report(base, owners, changed=False):
 
 
 def capture(store):
+    token = sync.read_regular(store.enrollment, True)
     policy = store.policy()
     if not sync.history_enabled(policy):
         return {'state':'capture-disabled'}
@@ -108,7 +124,8 @@ def capture(store):
     inventory = sync.local_inventory(store.codex, include_projects=False)
     allowed = inventory['history_threads']
     ledger, old = load_ledger(store, policy, raw, owners, allowed)
-    updated, counts = recall.capture(state, ledger, owners, active, allowed)
+    updated, counts = recall.capture(state, ledger, owners, active, allowed,
+                                     retained_owners=retained_owners(ledger,owners,policy))
     counts.update(retained_profiles=len(updated['histories']),
                   retained_scopes=sum(len(v) for v in updated['histories'].values()),
                   retained_entries=sum(len(rows) for v in updated['histories'].values() for rows in v.values()))
@@ -116,9 +133,12 @@ def capture(store):
     file, status_file = paths(store)
     # A native writer can change identity while we read the index. Never
     # attribute that newer state to the identity we originally observed.
-    sync.need(sync.read_regular(store.live) == raw and store.policy() == policy, 'capture-source-changed')
+    sync.need(sync.read_regular(store.live) == raw and consent_unchanged(store,token,policy),
+              'capture-source-changed')
     if wrapped != old:
         sync.replace(file, sync.as_json(wrapped))
+    prior_status = store.load(status_file, {})
+    if wrapped != old or prior_status.get('state') != 'captured':
         sync.replace(status_file, sync.packed({'state':'captured','time':int(time.time()),
                                                'counts':sync.numbers_only(counts)}))
     return {'state':'captured' if wrapped != old else 'capture-unchanged',
@@ -142,6 +162,7 @@ def validate_tx(store, tx, policy):
 
 def finish(store, tx, applied):
     if applied:
+        validate_tx(store,tx,store.policy())
         backup = store.backups/(tx['id']+'.json')
         if not backup.exists():
             sync.replace(backup,sync.as_json(tx))
@@ -150,6 +171,8 @@ def finish(store, tx, applied):
         store.mark('restored-modern-history' if tx.get('rollback') else 'synced-modern-history',tx['counts'])
     store.pending.unlink()
     sync.directory_sync(store.data)
+    if not applied:
+        return
     for f in sorted(store.backups.glob('*.json'), reverse=True)[sync.MAX_BACKUPS:]:
         sync.check_file(f,True)
         f.unlink()
@@ -172,6 +195,7 @@ def recover(store, raw, policy):
 
 
 def update(store, action, raw, policy, fresh=False):
+    token=sync.read_regular(store.enrollment,True) if os.path.lexists(store.enrollment) else None
     if action != 'plan':
         sync.need(store.is_offline(),'app-running-deferred')
         recover(store,raw,policy)
@@ -184,6 +208,8 @@ def update(store, action, raw, policy, fresh=False):
         sync.need(bool(points),'no-recovery-point')
         tx=store.load(points[0],None)
         validate_tx(store,tx,policy)
+        inv=sync.local_inventory(store.codex,include_projects=False)
+        sync.need(set(tx['scope_keys']) <= inv['history_threads'], 'recovery-thread-no-longer-local')
         sync.need(layout['active']==tx['owner'] and scope_values(state,tx['scope_keys'])==tx['next'],
                   'restore-point-diverged')
         prior=selected_history(state)
@@ -192,7 +218,6 @@ def update(store, action, raw, policy, fresh=False):
         new_ledger=tx['old_ledger']
         sync.need(new_ledger is not None,'recall-restore-baseline-missing')
         counts=report({},owners,prior!=tx['prior'])
-        inv=None
     elif not sync.history_enabled(policy):
         counts=report({'enabled':False},owners)
         if action != 'plan':
@@ -210,7 +235,8 @@ def update(store, action, raw, policy, fresh=False):
         if old_ledger is None:
             old_ledger=envelope(store,copy.deepcopy(ledger),policy)
         prior=selected_history(state)
-        ledger,history_counts=recall.merge(state,ledger,owners,layout['active'],allowed)
+        ledger,history_counts=recall.merge(state,ledger,owners,layout['active'],allowed,
+                                           retained_owners=retained_owners(ledger,owners,policy))
         new_ledger=envelope(store,ledger,policy)
         counts=report(history_counts,owners,prior!=selected_history(state))
     next_value=selected_history(state)
@@ -218,7 +244,8 @@ def update(store, action, raw, policy, fresh=False):
         return {'state':'preview','native_layout':LAYOUT,'counts':counts,
                 'baseline_would_change':new_ledger!=old_ledger}
     if next_value==prior:
-        sync.need(store.is_offline() and sync.read_regular(store.live)==raw,'source-changed-deferred')
+        sync.need(sync.read_regular(store.live)==raw
+                  and consent_unchanged(store,token,policy) and store.is_offline(),'source-changed-deferred')
         if store.load(paths(store)[0],None)!=new_ledger:
             sync.replace(paths(store)[0],sync.as_json(new_ledger))
         store.mark('modern-history-current',counts)
@@ -243,7 +270,7 @@ def update(store, action, raw, policy, fresh=False):
         sync.replace(store.pending,sync.as_json(receipt))
         try:
             stable=inv is None or sync.local_inventory(store.codex,include_projects=False)==inv
-            safe=stable and store.is_offline() and sync.read_regular(store.live)==raw and store.policy()==policy
+            safe=stable and sync.read_regular(store.live)==raw and consent_unchanged(store,token,policy) and store.is_offline()
         except Exception:
             finish(store,receipt,False)
             raise

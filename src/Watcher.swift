@@ -114,6 +114,7 @@ final class Watcher: NSObject {
     private var lastState: FileStamp?
     private var captureDeadline: TimeInterval?
     private var captureTimer: DispatchWorkItem?
+    private var captureWatchdog: DispatchWorkItem?
 
     init(workerURL: URL) {
         self.workerURL = workerURL
@@ -280,6 +281,8 @@ final class Watcher: NSObject {
         task.terminationHandler = { [weak self] finished in
             DispatchQueue.main.async {
                 guard let self, self.worker === finished else { return }
+                self.captureWatchdog?.cancel()
+                self.captureWatchdog = nil
                 self.worker = nil
                 self.queue.finished()
                 self.drain()
@@ -288,7 +291,21 @@ final class Watcher: NSObject {
         worker = task
         do {
             try task.run()
+            if trigger == .capture {
+                // Capture writes only the private ledger using atomic files.
+                // A stuck capture must not indefinitely block a later exit sync.
+                // Sync itself can commit native state and has no watchdog.
+                let timeout = DispatchWorkItem { [weak self, weak task] in
+                    guard let self, let task, self.worker === task, task.isRunning else { return }
+                    FileHandle.standardError.write(Data("Capture exceeded its 30-second deadline.\n".utf8))
+                    task.terminate()
+                }
+                captureWatchdog = timeout
+                DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: timeout)
+            }
         } catch {
+            captureWatchdog?.cancel()
+            captureWatchdog = nil
             worker = nil
             queue.finished()
             FileHandle.standardError.write(Data("Could not start the Codex continuity worker: \(error)\n".utf8))

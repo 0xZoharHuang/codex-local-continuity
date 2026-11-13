@@ -98,6 +98,14 @@ def capture_starts(root):
     return len(path.read_text().splitlines()) if path.exists() else 0
 
 
+def process_gone(pid):
+    try:
+        os.kill(pid,0)
+        return False
+    except ProcessLookupError:
+        return True
+
+
 def verify_captures(root):
     wait_for(lambda: captured(root,0), "startup capture of current file")
     time.sleep(0.65)
@@ -174,6 +182,83 @@ def verify_exit(root, pid):
     return observed[0]["elapsed_ms"]
 
 
+def verify_rapid_restart(root,bundle):
+    with fixture(bundle) as first:
+        time.sleep(0.3)
+        (root/"hold-capture").touch()
+        started = capture_starts(root)
+        write_state(root,40)
+        wait_for(lambda:capture_starts(root)>started, "capture blocked during rapid restart")
+        write_state(root,41)
+        time.sleep(0.6)
+        (root/f"quit-{first}").touch()
+        wait_for(lambda:process_gone(first), "old process exit before bundle replacement")
+        # Simulate an updater swapping the exact supported bundle while the
+        # worker is still occupied. This is the disposable test bundle only.
+        staged = root/"staged-app"
+        shutil.copytree(bundle,staged)
+        bundle.rename(root/"previous-app")
+        staged.rename(bundle)
+        with fixture(bundle) as second:
+            assert second != first
+            time.sleep(0.3)
+            (root/"hold-capture").unlink()
+            wait_for(lambda:captured(root,41), "capture after quick relaunch")
+            time.sleep(0.75)
+            assert not any(e["pid"]==first for e in events(root)), "stale exit sync ran after app relaunch"
+            assert events(root)[-1]["action"]=="capture"
+        elapsed = verify_exit(root,second)
+    assert not any(e["pid"]==first for e in events(root))
+    return elapsed
+
+
+def verify_worker_failure_and_pending_timer(root,bundle):
+    with fixture(bundle) as pid:
+        time.sleep(0.35)
+        (root/"fail-capture-once").touch()
+        write_state(root,50)
+        wait_for(lambda:any(e.get("simulated_failure") for e in captures(root)), "nonzero worker exit")
+        write_state(root,51)
+        wait_for(lambda:captured(root,51), "capture queue recovery after worker exception")
+        # Exit before the 0.5s capture timer fires. Sync must cover the latest
+        # persisted file and the cancelled timer must not wake another worker.
+        count = len(captures(root))
+        write_state(root,52)
+        (root/f"quit-{pid}").touch()
+        elapsed = verify_exit(root,pid)
+        time.sleep(0.75)
+        assert len(captures(root))==count, "capture timer fired after last target exited"
+        observed=[e for e in events(root) if e["pid"]==pid]
+        assert observed[0]["sequence_before_sync"]==52
+    return elapsed
+
+
+def verify_hung_capture_deadline(root,bundle):
+    with fixture(bundle) as pid:
+        time.sleep(0.35)
+        (root/"hang-capture-once").touch()
+        write_state(root,60)
+        wait_for(lambda:(root/"capture-hung").exists(), "permanently blocked capture")
+        child = int((root/"capture-hung").read_text())
+        (root/f"quit-{pid}").touch()
+        wait_for(lambda:process_gone(pid), "fixture exit while capture remains blocked")
+        started = time.time()
+        time.sleep(0.75)
+        assert not process_gone(child)
+        assert not any(e["pid"]==pid for e in events(root)), "sync overlapped the capture"
+        try:
+            wait_for(lambda:any(e["pid"]==pid for e in events(root)), "capture deadline releasing exit sync", timeout=34)
+        finally:
+            # If the watchdog regresses, clean up this fixture's child only.
+            if not process_gone(child):
+                os.kill(child,15)
+        elapsed = time.time()-started
+        assert 27 <= elapsed < 34, f"unexpected capture deadline {elapsed:.1f}s"
+        assert process_gone(child)
+        verify_exit(root,pid)
+    return elapsed
+
+
 def run(root):
     bundle = build(root)
     timings = []
@@ -203,17 +288,22 @@ def run(root):
         with fixture(bundle) as pid:
             wait_for(lambda: captured(root,999), "capture on app relaunch")
         timings.append(verify_exit(root,pid))
+        timings.append(verify_rapid_restart(root,bundle))
+        timings.append(verify_worker_failure_and_pending_timer(root,bundle))
+        deadline_elapsed = verify_hung_capture_deadline(root,bundle)
     before = capture_starts(root)
     with fixture(bundle) as pid, watcher(root):
         # The app must still be running while this second watcher discovers it.
         wait_for(lambda: capture_starts(root)>before, "capture of already-running app")
         (root / f"quit-{pid}").touch()
         timings.append(verify_exit(root, pid))
-    assert [r["trigger"] for r in events(root) if r["action"]=="sync"] == ["startup-offline"] + ["termination"] * 3
+    assert [r["trigger"] for r in events(root) if r["action"]=="sync"] == ["startup-offline"] + ["termination"] * 6
     calls = events(root)
     assert all(a["finished"]<=b["started"] for a,b in zip(calls,calls[1:])), "workers overlapped"
     print("PASS: native state capture, rename rearming, burst coalescing, bounded debounce, "
-          "directory noise filtering, sync priority and 3 natural exits. Exit elapsed ms:",timings)
+          "directory noise filtering, rapid restart, bundle replacement, failed worker recovery, "
+          "sync priority and 6 exit syncs. Exit elapsed ms:",timings,
+          "Hung capture released sync after seconds:",round(deadline_elapsed,1))
 
 
 if __name__ == "__main__":

@@ -105,6 +105,12 @@ def inspect(state):
     """
     _require(isinstance(state, dict) and all(isinstance(key, str) for key in state),
              "unsupported-identity-layout")
+    # Unrelated UI additions are harmless. New versions of ownership containers
+    # are not evidence that the old account-boundary contract still applies.
+    prefixes = ("electron-account-renderer-state-", "electron-renderer-content-owner-",
+                "electron-owner-atoms-v", "electron-owner-value-v")
+    _require(not any(key.startswith(prefixes) and key != LEGACY for key in state),
+             "unsupported-ownership-version")
     shared_markers = CONTENT_OWNER in state or any(
         key.startswith((OWNER_ATOMS, OWNER_VALUE, ACCOUNT_PREFERENCE)) for key in state
     )

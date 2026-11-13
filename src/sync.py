@@ -18,6 +18,11 @@ import tempfile
 import time
 import uuid
 
+# Entry-point execution and imports must share the same Refusal and sentinel
+# objects. The modern adapter imports this module during a running worker.
+if __name__ == "__main__":
+    sys.modules["sync"] = sys.modules[__name__]
+
 # The installed watcher invokes isolated system Python, with no user site or PYTHONPATH.
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -713,6 +718,7 @@ class Store:
         if not os.path.lexists(self.pending):
             return
         tx = self.load(self.pending, None)
+        need(tx.get('layout') is None, 'pending-native-layout-incompatible')
         guard_scope(tx, policy)
         gen = self._location()[2]
         self._guard_generation(tx,gen)
@@ -778,6 +784,7 @@ class Store:
             backups = sorted(self.backups.glob('*.json'), reverse=True)
             need(backups, 'no-recovery-point')
             b = self.load(backups[0], None)
+            need(b.get('layout') is None, 'recovery-native-layout-incompatible')
             self._guard_generation(b,generation)
             guard_scope(b, policy)
             self._guard_generation(b['old_baseline'],generation)

@@ -22,6 +22,130 @@ def texts(values):
 
 
 class RecallTests(unittest.TestCase):
+    def test_observed_empty_or_absent_window_preserves_later_equal_submission(self):
+        for cleared in ({}, {SCOPE: []}):
+            with self.subTest(cleared=bool(cleared)):
+                a=state({SCOPE:['again']})
+                ledger,_=recall.merge(a,None,OWNERS,'a',ALLOWED)
+                ledger,_=recall.capture(state(cleared),ledger,OWNERS,'a',ALLOWED)
+                ledger,counts=recall.capture(state({SCOPE:['again']}),ledger,OWNERS,'a',ALLOWED)
+                self.assertEqual(counts['observed_sends'],1)
+                b=state({})
+                ledger,_=recall.merge(b,ledger,OWNERS,'b',ALLOWED)
+                self.assertEqual(texts(b[recall.ATOMS][ATOM][SCOPE]),['again','again'])
+                snapshot=deepcopy((ledger,b))
+                ledger,_=recall.merge(b,ledger,OWNERS,'b',ALLOWED)
+                self.assertEqual(snapshot,(ledger,b))
+
+    def test_three_owner_roundtrips_quick_resets_and_same_owner_restart(self):
+        owners={'a','b','c'}
+        ledger=None
+        expected=[]
+        for i in range(12):
+            owner='abc'[i%3]
+            native=state({})
+            ledger,_=recall.capture(native,ledger,owners,owner,ALLOWED)
+            ledger,_=recall.merge(native,ledger,owners,owner,ALLOWED)
+            value='repeated' if i%2 else 'send-'+str(i)
+            native[recall.ATOMS][ATOM].setdefault(SCOPE,[]).append(value)
+            expected.append(value)
+            ledger,_=recall.capture(native,ledger,owners,owner,ALLOWED)
+            unchanged=deepcopy(ledger)
+            ledger,counts=recall.capture(native,ledger,owners,owner,ALLOWED)
+            self.assertEqual(unchanged,ledger)
+            self.assertEqual(counts['observed_sends'],0)
+            ledger,_=recall.merge(native,ledger,owners,owner,ALLOWED)
+            self.assertEqual(texts(native[recall.ATOMS][ATOM][SCOPE]),expected)
+            # The native app can clear the same account's cache on a restart.
+            restarted=state({SCOPE:[]})
+            ledger,_=recall.merge(restarted,ledger,owners,owner,ALLOWED)
+            self.assertEqual(texts(restarted[recall.ATOMS][ATOM][SCOPE]),expected)
+
+    def test_three_owner_rotation_crosses_capacity_without_reintroducing_evictions(self):
+        owners={'a','b','c'}
+        ledger=None
+        expected=[]
+        for i in range(3*CAP+5):
+            owner='abc'[i%3]
+            native=state({})
+            ledger,_=recall.merge(native,ledger,owners,owner,ALLOWED)
+            value='repeat' if i%3==2 else 'send-'+str(i)
+            rows=native[recall.ATOMS][ATOM].setdefault(SCOPE,[])
+            rows.append(value)
+            native[recall.ATOMS][ATOM][SCOPE]=rows[-CAP:]
+            expected=(expected+[value])[-CAP:]
+            ledger,_=recall.capture(native,ledger,owners,owner,ALLOWED)
+            ledger,_=recall.merge(native,ledger,owners,owner,ALLOWED)
+            self.assertEqual(texts(native[recall.ATOMS][ATOM][SCOPE]),expected)
+        stable=deepcopy((ledger,native))
+        ledger,_=recall.merge(native,ledger,owners,owner,ALLOWED)
+        self.assertEqual(stable,(ledger,native))
+
+    def test_unavailable_local_chat_keeps_cache_but_cannot_restore_until_reverified(self):
+        a=state({SCOPE:['local only']})
+        ledger,_=recall.merge(a,None,OWNERS,'a',ALLOWED)
+        b=state({})
+        ledger,_=recall.merge(b,ledger,OWNERS,'b',{OTHER})
+        self.assertNotIn(SCOPE,b[recall.ATOMS][ATOM])
+        self.assertEqual(texts(ledger['histories']['a'][SCOPE]),['local only'])
+        ledger,_=recall.merge(b,ledger,OWNERS,'b',ALLOWED)
+        self.assertEqual(texts(b[recall.ATOMS][ATOM][SCOPE]),['local only'])
+
+    def test_changed_consent_refuses_old_ledger_and_new_generation_starts_empty(self):
+        owners={'a','b','c'}
+        a=state({SCOPE:['old group']})
+        ledger,_=recall.merge(a,None,owners,'a',ALLOWED)
+        b=state({})
+        ledger,_=recall.merge(b,ledger,owners,'b',ALLOWED)
+        before=deepcopy((ledger,b))
+        with self.assertRaisesRegex(ValueError,'recall-ledger-outside-enrollment'):
+            recall.merge(b,ledger,{'b','c'},'b',ALLOWED)
+        self.assertEqual((ledger,b),before)
+        clean=state({})
+        fresh,_=recall.merge(clean,None,{'b','c'},'b',ALLOWED)
+        self.assertEqual(clean[recall.ATOMS][ATOM],{})
+        self.assertNotIn('old group',json.dumps(fresh))
+        # A temporary missing identity never destroys the old compatible cache.
+        restored=state({})
+        ledger,_=recall.merge(restored,ledger,owners,'c',ALLOWED)
+        self.assertEqual(texts(restored[recall.ATOMS][ATOM][SCOPE]),['old group'])
+
+    def test_retained_absent_identity_cannot_source_history_until_verified_return(self):
+        owners={'a','b','c'}
+        a=state({SCOPE:['absent owner query']})
+        ledger,_=recall.merge(a,None,owners,'a',ALLOWED)
+        owner_hash=recall._digest(bytes.fromhex(ledger['engine']['key']),['profile','a'])
+        retained=deepcopy({name:ledger[name].get('a') for name in ('histories','observed','native_views')})
+        retained_engine=deepcopy(ledger['engine']['views'][owner_hash])
+        b=state({})
+        ledger,_=recall.merge(b,ledger,{'b','c'},'b',ALLOWED,retained_owners=owners)
+        self.assertEqual(b[recall.ATOMS][ATOM],{})
+        for name,value in retained.items():
+            self.assertEqual(ledger[name].get('a'),value)
+        self.assertEqual(ledger['engine']['views'][owner_hash],retained_engine)
+        b[recall.ATOMS][ATOM][SCOPE]=['current owner query']
+        ledger,_=recall.capture(b,ledger,{'b','c'},'b',ALLOWED,retained_owners=owners)
+        a=state({})
+        ledger,_=recall.merge(a,ledger,owners,'a',ALLOWED,retained_owners=owners)
+        values=texts(a[recall.ATOMS][ATOM][SCOPE])
+        self.assertEqual(len(values),2)
+        self.assertCountEqual(values,['absent owner query','current owner query'])
+        previous=deepcopy((a,ledger))
+        ledger,_=recall.merge(a,ledger,owners,'a',ALLOWED,retained_owners=owners)
+        self.assertEqual(previous,(a,ledger))
+
+    def test_retention_permission_cannot_exceed_selected_identity_group(self):
+        ledger,_=recall.capture(state({SCOPE:['source private']}),None,OWNERS,'a',ALLOWED)
+        original=deepcopy(ledger)
+        with self.assertRaisesRegex(ValueError,'recall-ledger-outside-enrollment'):
+            recall.capture(state({}),ledger,{'b'},'b',ALLOWED,retained_owners={'b'})
+        with self.assertRaisesRegex(ValueError,'recall-owner-outside-retention-scope'):
+            recall.merge(state({}),ledger,{'a','b'},'b',ALLOWED,retained_owners={'a'})
+        # Retention permission alone cannot authorize an unverified active identity.
+        unchanged,_=recall.capture(state({SCOPE:['never capture']}),ledger,{'b'},'a',ALLOWED,
+                                    retained_owners=OWNERS)
+        self.assertEqual(unchanged,original)
+
     def test_capture_then_reset_new_b_restore_and_same_b_restart(self):
         a = state({SCOPE: ['repeat', 'repeat']})
         before = deepcopy(a)

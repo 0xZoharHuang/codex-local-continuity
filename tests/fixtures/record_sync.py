@@ -1,5 +1,6 @@
 """This test-only stand-in for sync.py never imports the real worker."""
 import json
+import fcntl
 import os
 from pathlib import Path
 import subprocess
@@ -13,9 +14,10 @@ action = sys.argv[1]
 trigger = os.environ["CODEX_CONTINUITY_TRIGGER"]
 started = time.time()
 lock = root / "worker.lock"
-with lock.open("x"):
-    pass
+lock_handle = lock.open("a")
+fcntl.flock(lock_handle,fcntl.LOCK_EX | fcntl.LOCK_NB)
 record = {"trigger": trigger, "pid": None, "action": action, "started": started}
+exit_code = 0
 if trigger == "termination":
     assert action == "sync"
     pid = int(os.environ["CODEX_CONTINUITY_EXIT_PID"])
@@ -35,6 +37,11 @@ elif action == "capture":
     assert trigger == "native-state-changed" and "CODEX_CONTINUITY_EXIT_PID" not in os.environ
     with (root / "capture-started").open("a") as file:
         print(started, file=file)
+    if (root/"hang-capture-once").exists():
+        (root/"hang-capture-once").unlink()
+        (root/"capture-hung").write_text(str(os.getpid()))
+        while True:
+            time.sleep(60)
     while (root / "hold-capture").exists() and time.time() - started < 8:
         time.sleep(0.02)
     try:
@@ -42,14 +49,20 @@ elif action == "capture":
         record["sequence"] = native.get("sequence")
     except (FileNotFoundError, ValueError):
         record["sequence"] = None
+    if (root/"fail-capture-once").exists():
+        (root/"fail-capture-once").unlink()
+        record["simulated_failure"] = True
+        exit_code = 2
 else:
     assert action == "sync"
     assert trigger == "startup-offline" and "CODEX_CONTINUITY_EXIT_PID" not in os.environ
 if action == "sync" and (root/"simulate-offline-write").exists():
+    record["sequence_before_sync"] = json.loads((root/"native/.codex-global-state.json").read_text()).get("sequence")
     temporary = root/"native/staged-json"
     temporary.write_text('{"sequence":999}')
     os.replace(temporary,root/"native/.codex-global-state.json")
 record["finished"] = time.time()
 with (root / "events.jsonl").open("a") as file:
     print(json.dumps(record), file=file)
-lock.unlink()
+lock_handle.close()
+sys.exit(exit_code)
